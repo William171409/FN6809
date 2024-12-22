@@ -1,0 +1,743 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# 1. Data Cleaning & Exploratory Analysis
+
+## 1.1 Data Cleaning
+
+```{r}
+# Load the tidyverse package
+library(tidyverse)
+library(ggplot2)
+library(tseries)
+library(FinTS)
+library(forecast)
+library(rugarch)
+library(xts)
+```
+
+```{r}
+# Define the file path
+file_path <- "/Users/huzihao/Documents/Postgraduate/mt3/FN6811/project/FTSE100.csv"
+
+# Load the data
+df <- read_csv(file_path)
+
+# Remove the undesirable column
+df <- df[,1:2]
+
+# Remove rows where all values are NA
+df <- df %>% filter(if_all(everything(), ~ !is.na(.)))
+
+# Display the first few rows
+print(head(df))
+
+```
+
+```{r}
+# Convert Date to datetime and sort in ascending order
+df <- df %>%
+  mutate(Date = as.Date(Date, format = "%Y-%m-%d")) %>%
+  arrange(Date)
+
+# Calculate log returns (in %)
+df <- df %>%
+  mutate(`Adj Price` = as.numeric(gsub(",", "", `Adj Price`))) %>%  # Clean and convert
+  mutate(`Log Return` = log(`Adj Price` / lag(`Adj Price`)) * 100) %>%
+  drop_na()  # Remove rows with NA values from the log return calculation
+
+# Display the first few rows
+print(head(df))
+```
+
+## 1.2 Data Exploratory Analysis
+
+```{r}
+
+# Plot Adjusted Price over time
+ggplot(df, aes(x = Date, y = `Adj Price`)) +
+  geom_line(color = "blue") +
+  ggtitle("FTSE 100 Adjusted Prices Over Time") +
+  xlab("Date") +
+  ylab("Adjusted Price") +
+  theme_minimal()
+
+# Plot Log Returns over time
+ggplot(df, aes(x = Date, y = `Log Return`)) +
+  geom_line(color = "orange") +
+  ggtitle("FTSE 100 Log Returns (%) Over Time") +
+  xlab("Date") +
+  ylab("Log Return (%)") +
+  theme_minimal()
+
+```
+
+```{r}
+# Extract Log Return column
+log_return <- df$`Log Return`
+
+# Train-test split: 90% train, 10% test
+train_length <- floor(0.9 * length(log_return))  # Calculate 90% length
+train_data <- log_return[1:train_length]        # Training data
+test_data <- log_return[(train_length + 1):length(log_return)]  # Test data
+
+# Print lengths of training and test datasets
+cat("Training Data Length:", length(train_data), "\n")
+cat("Test Data Length:", length(test_data), "\n")
+
+```
+
+```{r}
+initial_price<- df$`Adj Price`[1]
+```
+
+# 2. Time Series Analysis of Log Returns
+
+## 2.1 Test for Stationarity
+
+```{r}
+
+# Perform ADF test
+adf_result <- adf.test(train_data, alternative = "stationary")
+
+# Print results
+cat("ADF Statistic:", adf_result$statistic, "\n")
+cat("p-value:", adf_result$p.value, "\n")
+if (adf_result$p.value <= 0.05) {
+  cat("The series is stationary.\n")
+} else {
+    cat("The series is non-stationary.\n")
+}
+```
+
+```{r}
+adf.test(train_data, alternative = "stationary")
+```
+
+## 2.2 ACF & PACF
+
+```{r}
+# Plot ACF
+acf(train_data, main = "ACF of Training Data", lag.max = 20)
+
+# Plot PACF
+pacf(train_data, main = "PACF of Training Data", lag.max = 20)
+```
+
+## 2.3. ARIMA
+
+```{r}
+ARIMAModel <- setRefClass(
+  "ARIMAModel",
+  
+  fields = list(
+    data = "numeric",         # Original log return data
+    order = "numeric",        # ARIMA order (p, d, q)
+    test_size = "numeric",    # Size of the test set (proportion of data)
+    train_data = "numeric",   # Training data
+    test_data = "numeric",    # Test data
+    model = "ANY",            # ARIMA model object
+    residuals = "numeric",    # Residuals (numeric class)
+    lag = "numeric"           # Lag for tests
+  ),
+  
+  methods = list(
+    # Initialize the object with data, order, test_size, and lag
+    initialize = function(data, order, test_size = 0.2, lag = 10) {
+      data <<- data
+      order <<- order
+      test_size <<- test_size
+      lag <<- lag
+      
+      # Split the data into train and test sets
+      split_point <- floor(length(data) * (1 - test_size))
+      train_data <<- data[1:split_point]
+      test_data <<- data[(split_point + 1):length(data)]
+      
+      # Fit the ARIMA model on the training data
+      model <<- Arima(train_data, order = order)
+      residuals <<- as.numeric(residuals(model))  # Convert residuals to numeric
+    },
+    
+    # Summary of the ARIMA model
+    summary_model = function() {
+      return(summary(model))
+    },
+    
+    # Perform residual analysis
+    residual_analysis = function() {
+      # Plot residuals
+      plot(residuals, main = paste("Residuals of ARIMA(", order[1], ",", order[2], ",", order[3], ")", sep = ""), 
+           ylab = "Residuals", type = "l")
+      
+      # Ljung-Box test for independence
+      lb_test <- Box.test(residuals, lag = lag, type = "Ljung-Box")
+      
+      # ACF and PACF of residuals
+      acf(residuals, main = "ACF of Residuals")
+      pacf(residuals, main = "PACF of Residuals")
+      
+      # Shapiro-Wilk test for normality
+      shapiro_test <- shapiro.test(residuals)
+      
+      # Perform the ARCH test
+      arch_test <- ArchTest(residuals, lag = lag)
+      
+      # Return results
+      return(list(Ljung_Box_Test = lb_test, Shapiro_Test = shapiro_test, ARCH_Test = arch_test))
+    },
+    
+    # Forecast on test data and compute accuracy
+    multi_step_forecast_accuracy = function() {
+      forecast_values <- forecast(model, h = length(test_data))
+      accuracy(forecast_values, test_data)  # Calculate accuracy between forecast and actual test data
+    },
+        # Plot training data, predicted data, and actual test data
+    plot_forecast_vs_actual = function() {
+      # Forecast for the test data
+      forecast_values <- forecast(model, h = length(test_data))
+      
+      # Combine the training data, predicted values, and actual test data for plotting
+      plot(train_data, type = "l", col = "blue", xlim = c(1, length(data)), 
+           ylim = range(c(train_data, forecast_values$mean, test_data)), 
+           xlab = "Time", ylab = "Value", main = "Training, Forecasted, and Test Data")
+      
+      # Add forecasted values (predicted data)
+      lines((length(train_data) + 1):(length(train_data) + length(forecast_values$mean)),
+            forecast_values$mean, col = "red", lty = 2)
+      
+      # Add actual test data
+      lines((length(train_data) + 1):length(data), test_data, col = "green", lty = 1)
+      
+      # Add legend
+      legend("topleft", legend = c("Training Data", "Forecasted Data", "Test Data"),
+             col = c("blue", "red", "green"), lty = c(1, 2, 1), bty = "n")
+    }
+
+  )
+)
+```
+
+### 2.3.1 Manually specified model
+
+```{r}
+# Define ARIMA order
+order <- c(4, 0, 4)
+
+# Define the test size (e.g., 10% test data)
+test_size <- 0.1
+
+# Instantiate the ARIMAModel class
+model_manual <- ARIMAModel$new(data = log_return, order = order, test_size = test_size, lag = 10)
+
+# Get model summary
+print(model_manual$summary_model())
+
+# Perform residual analysis
+residual_results <- model_manual$residual_analysis()
+
+# Print residual analysis results
+print(residual_results)
+
+```
+
+```{r}
+# # Fit ARIMA(4, 0, 4)
+# model_manual <- Arima(train_data, order = c(4, 0, 4))
+# 
+# # Summary of the model
+# summary(model_manual)
+# 
+# # Extract residuals
+# residuals <- residuals(model_manual)
+# 
+# # Plot residuals
+# plot(residuals, main = "Residuals of ARIMA(4, 0, 4)", ylab = "Residuals", type = "l")
+# 
+# # Perform Ljung-Box test for independence
+# Box.test(residuals, lag = 10, type = "Ljung-Box")
+# 
+# # Plot ACF of residuals
+# acf(residuals, main = "ACF of Residuals")
+# 
+# # Plot PACF of residuals
+# pacf(residuals, main = "PACF of Residuals")
+# 
+# # Perform Shapiro-Wilk test for normality
+# shapiro_test <- shapiro.test(residuals)
+# 
+# # Display the result
+# print(shapiro_test)
+# 
+# 
+# # Perform the ARCH test on residuals
+# arch_test <- ArchTest(residuals, lag = 10)
+# 
+# # Display the result
+# print(arch_test)
+```
+
+### 2.3.2 Auto specified model
+
+```{r}
+# Automatically fit ARIMA model to identify the best order
+model_auto <- auto.arima(train_data)
+
+# Get the best ARIMA order from the auto.arima model
+best_order <- model_auto$arma[c(1, 6, 2)]  # Extract p, d, q from the model
+
+# Print the best order found by auto.arima
+print(paste("Best ARIMA order: (", best_order[1], ",", best_order[2], ",", best_order[3], ")", sep = ""))
+
+# Define the test size (e.g., 10% test data)
+test_size <- 0.1
+
+# Instantiate the ARIMAModel class with the best order and log return data
+model_auto <- ARIMAModel$new(data = log_return, order = best_order, test_size = test_size, lag = 10)
+
+# Get model summary
+print(model_auto$summary_model())
+
+# Perform residual analysis
+residual_results <- model_auto$residual_analysis()
+
+# Print residual analysis results
+print(residual_results)
+```
+
+```{r}
+model_manual$multi_step_forecast_accuracy()
+```
+
+```{r}
+model_auto$multi_step_forecast_accuracy()
+```
+
+## 2.4 Volatility
+
+### 2.4.1 arma(2,2)-garch(1,1)
+
+```{r}
+# Step 1: Ensure that 'df$Date' is in proper Date format and convert to POSIXct
+df$Date <- as.POSIXct(df$Date, tz = "Asia/Singapore")  # Set time zone to Asia/Singapore
+
+# Step 2: Create the xts object for the training data
+# Assuming 'train_data' is a vector of log returns and df$Date contains the corresponding time
+train_xts <- xts(df$`Log Return`[1:train_length], order.by = df$Date[1:train_length])
+
+# Step 3: Specify the ARMA-GARCH model
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),  # GARCH(1,1)
+  mean.model = list(armaOrder = c(2, 3)),  # ARMA(2,3)
+  distribution.model = "norm"  # Assuming normal distribution for innovations
+)
+
+# Step 4: Fit the ARMA-GARCH model on the training data
+arma23_garch11 <- ugarchfit(spec, data = train_xts)
+
+# Step 5: View the fitted model
+arma23_garch11
+```
+
+Insights
+
+1.  ARMA (Mean Dynamics):
+
+    -   Significant AR and MA terms indicate strong autocorrelation in the series.
+
+    -   The high magnitude of AR(1) and MA(1) coefficients suggests oscillatory and persistent effects, which could relate to underlying market dynamics or patterns.
+
+2.  GARCH (Variance Dynamics):
+
+    -   The low α1\alpha\_1α1​ and high β1\beta\_1β1​ values imply that volatility is more persistent (long-term effects dominate) than reactive to recent shocks.
+
+    -   This pattern is common in financial time series, where volatility tends to cluster over extended periods.
+
+3.  Volatility Clustering:
+
+    -   Significant GARCH components confirm the presence of volatility clustering, where periods of high and low volatility alternate.
+
+4.  Model Performance:
+
+    -   Given the significance of all parameters, this model likely captures the dynamics of the series well.
+
+### Key Takeaways:
+
+-   The residuals of your ARMA-GARCH model show **no significant serial correlation**, meaning the model has captured the autocorrelation structure well.
+
+-   The high p-values across all lags tested reinforce the adequacy of the fitted model in explaining the time series dynamics.
+
+### Key Takeaways:
+
+-   The **high** p-values across all tested lags suggest that there is **no significant evidence of remaining ARCH effects** in the residuals.
+
+-   Your GARCH(1,1) model appears to have adequately captured the conditional variance dynamics.
+
+    The **joint statistic** suggests the overall model is likely stable, but further formal thresholds would help confirm this.
+
+    **Parameter-specific insights**:
+
+    -   Stability is strong for ARMA coefficients (ar1ar1ar1, ar2ar2ar2, ma1ma1ma1, etc.).
+
+    -   Volatility parameters (ω\omegaω, α1\alpha1α1, β1\beta1β1) show relatively more variability, with ω\omegaω being the least stable.
+
+    -   This may imply potential challenges in modeling the baseline level of conditional variance
+
+### Interpretation with Critical Values:
+
+1.  **Joint Statistic**:
+
+    -   Your **Joint Statistic**: 1.98571.98571.9857
+
+    -   Critical Values: 10%10%10%: 2.12.12.1, 5%5%5%: 2.322.322.32, 1%1%1%: 2.822.822.82
+
+    -   Since 1.9857\<2.11.9857 \< 2.11.9857\<2.1 (the 10%10%10% critical value), we **fail to reject the null hypothesis** of overall parameter stability.
+
+        -   The model parameters appear to be stable as a whole.
+
+2.  **Individual Statistics**:
+
+    -   Critical Values: 10%10%10%: 0.350.350.35, 5%5%5%: 0.470.470.47, 1%1%1%: 0.750.750.75
+
+    -   Your individual statistics:
+
+        -   ar1=0.05045,ar2=0.04859,ma1=0.04231,ma2=0.06209,ma3=0.07748ar1 = 0.05045, ar2 = 0.04859, ma1 = 0.04231, ma2 = 0.06209, ma3 = 0.07748ar1=0.05045,ar2=0.04859,ma1=0.04231,ma2=0.06209,ma3=0.07748: All are **well below** 0.350.350.35, indicating strong stability.
+
+        -   mu=0.24617,α1=0.19587,β1=0.20921mu = 0.24617, \alpha1 = 0.19587, \beta1 = 0.20921mu=0.24617,α1=0.19587,β1=0.20921: Also **below** 0.350.350.35, confirming moderate stability.
+
+        -   ω=0.32258\omega = 0.32258ω=0.32258: Close to the 10%10%10% threshold of 0.350.350.35, suggesting **mild instability** in the baseline variance (ω\omegaω).
+
+#### Implications:
+
+1.  **Rejection of** H0H_0H0​:
+
+    -   The residuals **do not follow the assumed normal distribution**.
+
+    -   There may be **heavier tails or skewness** in the distribution of innovations, which normal distribution cannot capture well.
+
+2.  **Next Steps**:
+
+    -   Consider alternative distributions for the innovations, such as:
+
+        -   **Student's t-distribution** (`distribution.model = "std"`), which accounts for heavy tails.
+
+        -   **Skewed Student's t-distribution** (`distribution.model = "sstd"`), which handles both skewness and heavy tails.
+
+    -   Refit the GARCH model with these distributions and re-evaluate
+
+Make a plot selection (or 0 to exit):
+
+1: Series with 2 Conditional SD Superimposed 2: Series with 1% VaR Limits 3: Conditional SD (vs \|returns\|) 4: ACF of Observations 5: ACF of Squared Observations 6: ACF of Absolute Observations 7: Cross Correlation 8: Empirical Density of Standardized Residuals 9: QQ-Plot of Standardized Residuals 10: ACF of Standardized Residuals 11: ACF of Squared Standardized Residuals 12: News-Impact Curve
+
+```{r}
+# Plot the fitted values (volatility)
+# 1:   Series with 2 Conditional SD Superimposed
+
+# 3:   Conditional SD (vs |returns|)
+# What it shows: A plot of the estimated conditional standard deviation (volatility) against the absolute returns (|returns|).
+# Purpose: This helps assess if there is a relationship between the volatility (as estimated by the GARCH model) and the magnitude of returns, which can indicate how well the model captures the volatility clustering effect.
+
+
+# Plot "Series with 2 Conditional SD Superimposed" in the first row
+plot(arma23_garch11, which = 1)
+
+# Plot "Conditional SD (vs |returns|)" in the second row
+plot(arma23_garch11, which = 3)
+```
+
+```{r}
+# What it shows: The autocorrelation function (ACF) of the standardized residuals (residuals divided by the conditional volatility).
+# Purpose: This helps to check for any remaining serial correlation in the residuals. If the residuals are independently and identically distributed (i.i.d.), their ACF should not show significant autocorrelation.
+ 
+
+plot(arma23_garch11, which = 10)
+# What it shows: The autocorrelation function (ACF) of the squared standardized residuals.
+# Purpose: This helps assess whether there is any remaining volatility clustering in the residuals. If there is significant autocorrelation, it may indicate that the model has not captured all of the volatility clustering.
+
+plot(arma23_garch11, which =11)
+```
+
+```{r}
+# What it shows: The empirical density (or histogram) of the standardized residuals from the model, which are the residuals scaled by the estimated conditional standard deviation.
+# Purpose: Helps check if the residuals are approximately normally distributed. If the residuals follow normal distribution, this plot should resemble a bell curve.
+
+plot(arma23_garch11, which = 8)
+
+# What it shows: The quantile-quantile (QQ) plot of the standardized residuals. It compares the distribution of the residuals to a normal distribution.
+# Purpose: This plot helps diagnose the normality of the residuals. If the points lie along the straight line, it suggests that the residuals follow a normal distribution.
+
+plot(arma23_garch11, which = 9)
+```
+
+1\. **Non-Normality of Residuals in GARCH Models**
+
+-   In a **GARCH** model, particularly when you're modeling financial time series, it's common to find that the **standardized residuals** are **not normally distributed**. Financial data often exhibit **skewness**, **heavy tails**, and **volatility clustering**, all of which contribute to non-normality in the residuals.
+
+-   The **Shapiro-Wilk test** or other normality tests might flag this as a problem, but as your econometrics book suggests, it's not necessarily a critical issue for model estimation, as long as other conditions are met.
+
+2\. **Why Non-Normality Isn't a Major Problem for Parameter Estimation**
+
+-   **Parameter Consistency:** As long as the model's mean (ARMA) and variance (GARCH) equations are correctly specified, the **parameter estimates** will still be consistent and unbiased, even if the residuals are not normally distributed.
+
+-   **Efficiency:** While the parameter estimates are consistent, they may **no longer be efficient** if the residuals are not normal, which means the usual estimates of **standard errors** might be biased or inconsistent.
+
+3\. **The Role of Bollerslev-Wooldridge Standard Errors (QML)**
+
+-   The **quasi-maximum likelihood (QML)** estimation method, using the **Bollerslev-Wooldridge standard errors**, is commonly used in the context of GARCH models to **correct for heteroskedasticity and non-normality** in the residuals.
+
+-   These robust standard errors help adjust the confidence intervals and significance tests to account for the fact that the residuals might not follow a normal distribution, ensuring that the inference remains valid despite the non-normality.
+
+```{r}
+plot(arma23_garch11, which = 12)
+```
+
+### 2.4.2 arma(2,2)-garch(1,1) studentized T dist
+
+```{r}
+spec_std <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),  # GARCH(1,1)
+  mean.model = list(armaOrder = c(2, 3)),  # ARMA(2,3)
+  distribution.model = "std"  
+)
+
+# Step 4: Fit the ARMA-GARCH model on the training data
+arma23_garch11_std <- ugarchfit(spec_std, data = train_xts)
+
+# Step 5: View the fitted model
+arma23_garch11_std
+```
+
+```{r}
+# 1,2 , 8,9,10,11,12
+par(mar = c(2, 2, 2, 2))  # Adjust values as necessary
+plot(arma23_garch11_std,which="all")
+par(mfrow = c(1, 1))
+```
+
+### 2.4.3 arma(2,2)-garch(1,1) skewed studentized T dist
+
+```{r}
+spec_sstd <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),  # GARCH(1,1)
+  mean.model = list(armaOrder = c(2, 3)),  # ARMA(2,3)
+  distribution.model = "sstd"  
+)
+
+# Step 4: Fit the ARMA-GARCH model on the training data
+arma23_garch11_sstd <- ugarchfit(spec_sstd, data = train_xts)
+
+# Step 5: View the fitted model
+arma23_garch11_sstd
+```
+
+```{r}
+par(mar = c(2, 2, 2, 2))  # Adjust values as necessary
+plot(arma23_garch11_sstd,which="all")
+par(mfrow = c(1, 1))
+```
+
+```{r}
+forecast_garch11 <- ugarchforecast(arma23_garch11, n.ahead = length(test_data))
+forecast_garch11_sstd <- ugarchforecast(arma23_garch11_sstd, n.ahead = length(test_data))
+forecast_garch11_std <- ugarchforecast(arma23_garch11_std, n.ahead = length(test_data))
+
+# Calculate RMSE for each model's forecast
+rmse_garch11 <- sqrt(mean((forecast_garch11@forecast$seriesFor - test_data)^2))
+rmse_garch11_sstd <- sqrt(mean((forecast_garch11_sstd@forecast$seriesFor - test_data)^2))
+rmse_garch11_std <- sqrt(mean((forecast_garch11_std@forecast$seriesFor - test_data)^2))
+
+# Compare RMSE values
+print(rmse_garch11)
+print(rmse_garch11_sstd)
+print(rmse_garch11_std)
+```
+
+### Forecastings
+
+```{r}
+log_return_xts <- xts(df$`Log Return`, order.by = df$Date)  # Full dataset
+```
+
+```{r}
+# Define the rolling forecast using ugarchroll
+roll <- ugarchroll(
+  spec = spec, 
+  data = log_return_xts, 
+  n.ahead = 1,  # 1-step ahead forecast
+  forecast.length = length(test_data),  # Forecast over the test set length
+  refit.every = 1,  # Refit every 1 period
+  refit.window = "moving",  # Use moving window (instead of expanding)
+  window.size = 252,  # Set window size (e.g., 252 for 1 year of daily data)
+  solver = "hybrid",  # Solver for optimization
+  fit.control = list(), 
+  solver.control = list()
+)
+```
+
+```{r}
+resume_roll<-resume(roll)
+```
+
+```{r}
+report(resume_roll,type="fpm")
+```
+
+```{r}
+par(mar = c(2, 2, 2, 2))  # Adjust values as necessary
+plot(resume_roll,which="all")
+par(mfrow = c(1,1))  # Adjust values as necessary
+```
+
+```{r}
+# Define the rolling forecast using ugarchroll
+roll_std <- ugarchroll(
+  spec = spec_std, 
+  data = log_return_xts, 
+  n.ahead = 1,  # 1-step ahead forecast
+  forecast.length = length(test_data),  # Forecast over the test set length
+  refit.every = 1,  # Refit every 1 period
+  refit.window = "moving",  # Use moving window (instead of expanding)
+  window.size = 252,  # Set window size (e.g., 252 for 1 year of daily data)
+  solver = "hybrid",  # Solver for optimization
+  fit.control = list(), 
+  solver.control = list()
+)
+```
+
+```{r}
+resume_roll_std<-resume(roll_std)
+```
+
+```{r}
+report(resume_roll_std,type="fpm")
+par(mar = c(2, 2, 2, 2))  # Adjust values as necessary
+plot(resume_roll_std,which="all")
+par(mfrow = c(1,1))  # Adjust values as necessary
+```
+
+```{r}
+# Define the rolling forecast using ugarchroll
+roll_sstd <- ugarchroll(
+  spec = spec_sstd, 
+  data = log_return_xts, 
+  n.ahead = 1,  # 1-step ahead forecast
+  forecast.length = length(test_data),  # Forecast over the test set length
+  refit.every = 1,  # Refit every 1 period
+  refit.window = "moving",  # Use moving window (instead of expanding)
+  window.size = 252,  # Set window size (e.g., 252 for 1 year of daily data)
+  solver = "hybrid",  # Solver for optimization
+  fit.control = list(), 
+  solver.control = list()
+)
+resume_roll_sstd<-resume(roll_sstd)
+```
+
+```{r}
+report(resume_roll_sstd,type="fpm")
+par(mar = c(2, 2, 2, 2))  # Adjust values as necessary
+plot(resume_roll_sstd,which="all")
+par(mfrow = c(1,1))  # Adjust values as necessary
+```
+
+## 2.5 Leverage Effect/ Garch-mean
+
+```{r}
+spec_egarch <- ugarchspec(
+  variance.model = list(model = "eGARCH", garchOrder = c(1, 1)),  # EGARCH(1,1)
+  mean.model = list(armaOrder = c(2, 3)),  # ARMA(2,3)
+  distribution.model = "norm"  # Using t-distribution to model heavy tails
+)
+
+arma23_egarch11 <- ugarchfit(spec_egarch, data = train_xts)
+arma23_egarch11
+```
+
+```{r}
+par(mar = c(2, 2, 2, 2))  # Adjust values as necessary
+plot(arma23_egarch11,which="all")
+par(mfrow = c(1, 1))
+```
+
+```{r}
+plot(arma23_egarch11,which=12)
+```
+
+```{r}
+# Define the rolling forecast using ugarchroll
+roll_e <- ugarchroll(
+  spec = spec_egarch, 
+  data = log_return_xts, 
+  n.ahead = 1,  # 1-step ahead forecast
+  forecast.length = length(test_data),  # Forecast over the test set length
+  refit.every = 1,  # Refit every 1 period
+  refit.window = "moving",  # Use moving window (instead of expanding)
+  window.size = 252,  # Set window size (e.g., 252 for 1 year of daily data)
+  solver = "hybrid",  # Solver for optimization
+  fit.control = list(), 
+  solver.control = list()
+)
+resume_roll_e<-resume(roll_e)
+```
+
+```{r}
+report(resume_roll_e,type="fpm")
+```
+
+```{r}
+par(mar = c(2, 2, 2, 2))  # Adjust values as necessary
+plot(resume_roll_e,which="all")
+par(mfrow = c(1,1))  # Adjust values as necessary
+```
+
+```{r}
+# garch in mean
+spec_garch_mean <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),  # EGARCH(1,1)
+  mean.model = list(armaOrder = c(2, 3), include.mean = TRUE, archm = TRUE, archpow = 1),
+  distribution.model = "norm"  # Using t-distribution to model heavy tails
+)
+
+arma23_garch11_mean <- ugarchfit(spec_garch_mean, data = train_xts)
+arma23_garch11_mean
+```
+
+```{r}
+par(mar = c(2, 2, 2, 2))  # Adjust values as necessary
+plot(arma23_garch11_mean,which="all")
+par(mfrow = c(1, 1))
+```
+
+```{r}
+# Define the rolling forecast using ugarchroll
+# roll_m <- ugarchroll(
+#   spec = spec_garch_mean, 
+#   data = log_return_xts, 
+#   n.ahead = 1,  # 1-step ahead forecast
+#   forecast.length = length(test_data),  # Forecast over the test set length
+#   refit.every = 1,  # Refit every 1 period
+#   refit.window = "moving",  # Use moving window (instead of expanding)
+#   window.size = 252,  # Set window size (e.g., 252 for 1 year of daily data)
+#   solver = "hybrid",  # Solver for optimization
+#   fit.control = list(), 
+#   solver.control = list()
+# )
+# 
+# resume_roll_m <- resume(roll_m)
+```
+
+```{r}
+#report(resume_roll_m,type="fpm")
+```
+
+```{r}
+#par(mar = c(2, 2, 2, 2))  # Adjust values as necessary
+#plot(resume_roll_m,which="all")
+#par(mfrow = c(1,1))  # Adjust values as necessary
+```
